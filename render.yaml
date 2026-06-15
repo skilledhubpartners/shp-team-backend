@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: shp-team-backend
+    env: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: MONGO_URL
+        sync: false
+      - key: DB_NAME
+        value: shp_team_db
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: FRONTEND_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_EMAIL
+        value: admin@shpteam.in
+      - key: ADMIN_PASSWORD
+        value: ShpAdmin@2025
+      - key: STRIPE_API_KEY
+        value: sk_test_emergent
+      - key: RAZORPAY_KEY_ID
+        value: rzp_live_Svcz8NeCVlUdHP
+      - key: RAZORPAY_KEY_SECRET
+        value: zqTc3MvYAUPx39US8hD7KWqC
