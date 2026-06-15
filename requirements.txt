@@ -10,3 +10,4 @@ python-multipart
 razorpay
 stripe
 python-dotenv
+PyJWT
