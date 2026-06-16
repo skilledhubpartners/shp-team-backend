@@ -43,6 +43,37 @@ db = client[os.environ['DB_NAME']]
 app = FastAPI(title="SHP TEAM API")
 api = APIRouter(prefix="/api")
 
+# ---------- CORS (must be added immediately after app creation,
+# before mounting static files or including routers) ----------
+cors_origins_env = os.environ.get("CORS_ORIGINS", "").strip()
+if cors_origins_env:
+    origins = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
+else:
+    # Default to localhost for development
+    origins = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+    # Add preview URL if REACT_APP_BACKEND_URL is set
+    backend_url = os.environ.get("REACT_APP_BACKEND_URL", "")
+    if backend_url and "preview.emergentagent.com" in backend_url:
+        preview_domain = backend_url.split("/api")[0] if "/api" in backend_url else backend_url
+        origins.append(preview_domain.replace("https://", "http://").replace(":443", ""))
+        origins.append(preview_domain)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("shp")
+logger.info(f"CORS Origins configured: {origins}")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
 # uploads
 UPLOAD_DIR = ROOT_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -2095,44 +2126,9 @@ async def reject_user(user_id: str, _: dict = Depends(require_admin)):
     return {"status": "rejected", "user_id": user_id}
 
 
-# ---------- Register router + CORS ----------
+# ---------- Register router ----------
 app.include_router(api)
 
-# CORS Origins - must explicitly list origins when using credentials
-cors_origins_env = os.environ.get("CORS_ORIGINS", "").strip()
-if cors_origins_env:
-    origins = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
-else:
-    # Default to localhost for development
-    origins = [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ]
-    # Add preview URL if REACT_APP_BACKEND_URL is set
-    backend_url = os.environ.get("REACT_APP_BACKEND_URL", "")
-    if backend_url:
-        # Extract origin from backend URL and add corresponding frontend origins
-        if "preview.emergentagent.com" in backend_url:
-            # Add the preview domain
-            preview_domain = backend_url.split("/api")[0] if "/api" in backend_url else backend_url
-            origins.append(preview_domain.replace("https://", "http://").replace(":443", ""))
-            origins.append(preview_domain)
-
-# Log CORS configuration
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("shp")
-logger.info(f"🔒 CORS Origins configured: {origins}")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"]
-)
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("shp")
 
 # ---------- App Startup ----------
