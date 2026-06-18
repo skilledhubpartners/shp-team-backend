@@ -10,6 +10,7 @@ import logging
 import asyncio
 import json
 import shutil
+import secrets
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal, Dict, Set
 
@@ -24,15 +25,12 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 
-# Stripe via emergentintegrations
-from emergentintegrations.payments.stripe.checkout import (
-    StripeCheckout, CheckoutSessionRequest
-)
-
 # Razorpay
 import razorpay
 import hmac
 import hashlib
+
+from email_utils import send_notification_email, send_email_to, build_lead_email, build_booking_email, build_reset_email
 
 # ---------- Mongo ----------
 mongo_url = os.environ['MONGO_URL']
@@ -336,7 +334,8 @@ async def register(payload: RegisterIn, response: Response):
 @api.post("/auth/login", response_model=UserPublic)
 async def login(payload: LoginIn, request: Request, response: Response):
     email = payload.email.lower()
-    ip = request.client.host if request.client else "unknown"
+    xff = request.headers.get("x-forwarded-for", "")
+    ip = xff.split(",")[0].strip() if xff else (request.client.host if request.client else "unknown")
     ident = f"{ip}:{email}"
     attempt = await db.login_attempts.find_one({"identifier": ident})
     if attempt and attempt.get("count", 0) >= 5:
@@ -375,6 +374,50 @@ async def me(user: dict = Depends(get_current_user)):
                       phone=user.get("phone"), city=user.get("city"),
                       created_at=datetime.fromisoformat(user["created_at"]) if isinstance(user["created_at"], str) else user["created_at"])
 
+
+class ForgotPasswordIn(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordIn(BaseModel):
+    token: str
+    password: str = Field(min_length=6)
+
+
+@api.post("/auth/forgot-password")
+async def forgot_password(payload: ForgotPasswordIn):
+    email = payload.email.lower()
+    user = await db.users.find_one({"email": email})
+    # Always return success to avoid revealing which emails are registered
+    if user:
+        token = secrets.token_urlsafe(32)
+        expires = datetime.now(timezone.utc) + timedelta(hours=1)
+        await db.password_reset_tokens.insert_one({
+            "token": token, "user_id": user["id"], "email": email,
+            "expires_at": expires.isoformat(), "used": False,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        frontend = os.environ.get("FRONTEND_URL", "").rstrip("/")
+        reset_link = f"{frontend}/reset-password?token={token}"
+        subject, html = build_reset_email(user.get("name", ""), reset_link)
+        await send_email_to(email, subject, html)
+        logging.getLogger("shp").info("Password reset link for %s: %s", email, reset_link)
+    return {"ok": True, "message": "If an account with that email exists, a reset link has been sent."}
+
+
+@api.post("/auth/reset-password")
+async def reset_password(payload: ResetPasswordIn):
+    rec = await db.password_reset_tokens.find_one({"token": payload.token})
+    if not rec or rec.get("used"):
+        raise HTTPException(status_code=400, detail="Invalid or already-used reset link.")
+    expires = datetime.fromisoformat(rec["expires_at"])
+    if datetime.now(timezone.utc) > expires:
+        raise HTTPException(status_code=400, detail="This reset link has expired. Please request a new one.")
+    await db.users.update_one({"id": rec["user_id"]}, {"$set": {"password_hash": hash_password(payload.password)}})
+    await db.password_reset_tokens.update_one({"token": payload.token}, {"$set": {"used": True}})
+    await db.login_attempts.delete_many({"identifier": {"$regex": f":{rec['email']}$"}})
+    return {"ok": True, "message": "Password updated successfully. You can now sign in."}
+
 # ---------- Leads ----------
 @api.post("/leads", response_model=LeadOut)
 async def create_lead(payload: LeadIn):
@@ -382,6 +425,8 @@ async def create_lead(payload: LeadIn):
     doc = {**payload.model_dump(), "id": lid, "status": "new", "created_at": now.isoformat()}
     await db.leads.insert_one(doc)
     await hub.broadcast("admin", {"type": "lead.created", "title": "New lead", "body": f"{payload.name} · {payload.city} · {payload.service}", "at": now.isoformat()})
+    subject, html = build_lead_email(doc)
+    await send_notification_email(subject, html)
     return LeadOut(id=lid, status="new", created_at=now, **payload.model_dump())
 
 @api.get("/leads", response_model=List[LeadOut])
@@ -537,76 +582,11 @@ async def list_uploads(user: dict = Depends(get_current_user)):
         items.append(d)
     return items
 
-# ---------- Stripe payments ----------
-def _stripe_client(request: Request) -> StripeCheckout:
-    host_url = str(request.base_url).rstrip("/")
-    return StripeCheckout(api_key=os.environ["STRIPE_API_KEY"], webhook_url=f"{host_url}/api/webhook/stripe")
-
+# ---------- Payment packages (Razorpay is the active payment gateway) ----------
 @api.get("/payments/packages")
 async def payment_packages():
     pkgs = await _packages_from_config()
     return [{"id": k, **v} for k, v in pkgs.items()]
-
-@api.post("/payments/checkout")
-async def create_checkout(payload: CheckoutIn, request: Request, user: Optional[dict] = Depends(get_current_user_optional)):
-    pkg = await _resolve_package(payload.package_id)
-    if not pkg: raise HTTPException(status_code=400, detail="Invalid package")
-    origin = payload.origin_url.rstrip("/")
-    success_url = f"{origin}/payments/success?session_id={{CHECKOUT_SESSION_ID}}"
-    cancel_url = f"{origin}/payments/cancel"
-    sc = _stripe_client(request)
-    metadata = {"package_id": payload.package_id, "user_id": user["id"] if user else "guest",
-                "project_title": payload.project_title or ""}
-    session = await sc.create_checkout_session(CheckoutSessionRequest(
-        amount=float(pkg["amount"]), currency=pkg["currency"],
-        success_url=success_url, cancel_url=cancel_url, metadata=metadata,
-    ))
-    now = datetime.now(timezone.utc)
-    await db.payment_transactions.insert_one({
-        "session_id": session.session_id, "amount": float(pkg["amount"]), "currency": pkg["currency"],
-        "package_id": payload.package_id, "user_id": user["id"] if user else None,
-        "user_email": user["email"] if user else None, "metadata": metadata,
-        "payment_status": "initiated", "status": "open",
-        "created_at": now.isoformat(),
-    })
-    return {"url": session.url, "session_id": session.session_id}
-
-@api.get("/payments/status/{session_id}")
-async def payment_status(session_id: str, request: Request):
-    sc = _stripe_client(request)
-    status = await sc.get_checkout_status(session_id)
-    rec = await db.payment_transactions.find_one({"session_id": session_id})
-    if rec and rec.get("payment_status") != status.payment_status:
-        await db.payment_transactions.update_one(
-            {"session_id": session_id},
-            {"$set": {"payment_status": status.payment_status, "status": status.status,
-                      "updated_at": datetime.now(timezone.utc).isoformat()}}
-        )
-        if status.payment_status == "paid":
-            await hub.broadcast("admin", {"type": "payment.succeeded",
-                "title": "Payment received",
-                "body": f"₹{status.amount_total/100:.2f} {status.currency.upper()} · {status.metadata.get('package_id','')}",
-                "at": datetime.now(timezone.utc).isoformat()})
-    return {"payment_status": status.payment_status, "status": status.status,
-            "amount_total": status.amount_total, "currency": status.currency,
-            "metadata": status.metadata}
-
-@app.post("/api/webhook/stripe")
-async def stripe_webhook(request: Request):
-    body = await request.body()
-    sc = _stripe_client(request)
-    sig = request.headers.get("Stripe-Signature")
-    try:
-        ev = await sc.handle_webhook(body, sig)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Webhook error: {e}")
-    if ev.session_id:
-        await db.payment_transactions.update_one(
-            {"session_id": ev.session_id},
-            {"$set": {"payment_status": ev.payment_status, "event_type": ev.event_type,
-                      "updated_at": datetime.now(timezone.utc).isoformat()}}
-        )
-    return {"received": True}
 
 
 # ---------- Bookings: Consultations ----------
@@ -702,6 +682,8 @@ async def verify_consultation_payment(
         "body": f"{booking['name']} · {booking['consultation_type']} · {booking['date']}",
         "at": datetime.now(timezone.utc).isoformat()
     })
+    subject, html = build_booking_email(booking)
+    await send_notification_email(subject, html)
     
     return {"status": "confirmed", "booking_id": booking["id"]}
 
@@ -807,6 +789,8 @@ async def verify_site_visit_payment(
         "body": f"{booking['name']} · {booking['package_label']} · {booking['city']} · {booking['date']}",
         "at": datetime.now(timezone.utc).isoformat()
     })
+    subject, html = build_booking_email(booking)
+    await send_notification_email(subject, html)
     
     return {"status": "confirmed", "booking_id": booking["id"]}
 
@@ -1984,7 +1968,7 @@ async def get_videos(_: dict = Depends(require_admin), section: Optional[str] = 
     videos = await db.videos.find(query, {"_id": 0}).sort("order", 1).to_list(100)
     return [VideoOut(**v) for v in videos]
 
-@api.get("/api/videos", response_model=List[VideoOut])
+@api.get("/videos", response_model=List[VideoOut])
 async def get_public_videos(section: Optional[str] = None):
     """Get active videos (Public endpoint)"""
     query = {"active": True}
