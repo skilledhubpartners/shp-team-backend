@@ -595,7 +595,7 @@ async def create_consultation_order(payload: ConsultationBookingIn):
     """Create payment order for consultation booking"""
     bid = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
-    amount_inr = CONSULTATION_FEE
+    amount_inr = await _get_live_price("consultation", CONSULTATION_FEE)
     
     booking_doc = {
         "id": bid,
@@ -698,7 +698,7 @@ async def create_site_visit_order(payload: SiteVisitBookingIn):
     if not package_info:
         raise HTTPException(status_code=400, detail="Invalid package")
     
-    amount_inr = package_info["amount"]
+    amount_inr = await _get_live_price(f"site_visit_{payload.package}", package_info["amount"])
     
     booking_doc = {
         "id": bid,
@@ -922,20 +922,21 @@ async def create_subscription(payload: SubscriptionRequest, user: dict = Depends
     
     # Validate plan
     valid_plans = {
-        "monthly": {"amount": 149, "duration": "month"},
-        "yearly": {"amount": 1499, "duration": "year"}
+        "monthly": {"amount": await _get_live_price("subscription_monthly", 149.0), "duration": "month"},
+        "yearly": {"amount": await _get_live_price("subscription_yearly", 1499.0), "duration": "year"}
     }
     
     if payload.plan_id not in valid_plans:
         raise HTTPException(status_code=400, detail="Invalid plan selected")
     
     expected = valid_plans[payload.plan_id]
-    if payload.amount != expected["amount"]:
-        raise HTTPException(status_code=400, detail=f"Invalid amount for {payload.plan_id} plan")
+    # The amount actually charged always comes from the server-side config above,
+    # never from payload.amount — a client can't be trusted to set its own price.
+    charge_amount = expected["amount"]
     
     # Create Razorpay order
     order = razorpay_client.order.create({
-        "amount": payload.amount * 100,  # Amount in paise
+        "amount": int(charge_amount * 100),  # Amount in paise
         "currency": "INR",
         "payment_capture": 1
     })
@@ -948,8 +949,8 @@ async def create_subscription(payload: SubscriptionRequest, user: dict = Depends
         "user_name": user.get("name", ""),
         "plan_id": payload.plan_id,
         "plan_name": payload.plan_name,
-        "amount": payload.amount,
-        "duration": payload.duration,
+        "amount": charge_amount,
+        "duration": expected["duration"],
         "currency": "INR",
         "razorpay_order_id": order["id"],
         "status": "pending",
@@ -962,7 +963,7 @@ async def create_subscription(payload: SubscriptionRequest, user: dict = Depends
     
     return {
         "razorpay_order_id": order["id"],
-        "amount": payload.amount,
+        "amount": charge_amount,
         "currency": "INR",
         "key_id": os.environ.get("RAZORPAY_KEY_ID")
     }
@@ -1106,13 +1107,18 @@ async def update_booking(booking_id: str, payload: dict, _: dict = Depends(requi
 @api.get("/bookings/packages")
 async def get_booking_packages():
     """Get consultation and site visit package information"""
+    consultation_amount = await _get_live_price("consultation", CONSULTATION_FEE)
+    site_visit = {}
+    for tier, info in SITE_VISIT_PACKAGES.items():
+        amount = await _get_live_price(f"site_visit_{tier}", info["amount"])
+        site_visit[tier] = {**info, "amount": amount}
     return {
         "consultation": {
-            "amount": CONSULTATION_FEE,
+            "amount": consultation_amount,
             "currency": "INR",
             "types": ["phone", "google_meet", "video_call"]
         },
-        "site_visit": SITE_VISIT_PACKAGES
+        "site_visit": site_visit
     }
 
 # ---------- Work Opportunities: Admin ----------
@@ -1313,8 +1319,9 @@ async def unlock_opportunity(opp_id: str, user: dict = Depends(get_current_user)
         raise HTTPException(status_code=404, detail="Opportunity not found")
     
     # Create Razorpay order
+    unlock_amount = await _get_live_price("site_access_fee", SITE_ACCESS_FEE)
     order = razorpay_client.order.create({
-        "amount": int(SITE_ACCESS_FEE * 100),  # Convert to paise
+        "amount": int(unlock_amount * 100),  # Convert to paise
         "currency": "INR",
         "receipt": f"unlock_{opp_id[:20]}",
         "notes": {
@@ -1330,7 +1337,7 @@ async def unlock_opportunity(opp_id: str, user: dict = Depends(get_current_user)
         "opportunity_id": opp_id,
         "contractor_id": user["id"],
         "contractor_email": user["email"],
-        "amount": SITE_ACCESS_FEE,
+        "amount": unlock_amount,
         "currency": "INR",
         "razorpay_order_id": order["id"],
         "payment_status": "pending",
@@ -1340,7 +1347,7 @@ async def unlock_opportunity(opp_id: str, user: dict = Depends(get_current_user)
     
     return {
         "razorpay_order_id": order["id"],
-        "amount": SITE_ACCESS_FEE,
+        "amount": unlock_amount,
         "currency": "INR",
         "key_id": os.environ.get("RAZORPAY_KEY_ID")
     }
@@ -1527,11 +1534,13 @@ DEFAULT_SITE_CONFIG = {
     },
     "stats": {"projects_completed": 12480, "cities_served": 38, "skilled_professionals": 5200, "satisfaction_rate": 98},
     "pricing": {
-        "consultation":     {"label": "Design Consultation", "amount": 49.0,   "currency": "usd"},
-        "site_visit":       {"label": "Site Visit & Quote",  "amount": 99.0,   "currency": "usd"},
-        "milestone_small":  {"label": "Milestone — Small",   "amount": 499.0,  "currency": "usd"},
-        "milestone_medium": {"label": "Milestone — Medium",  "amount": 1999.0, "currency": "usd"},
-        "milestone_large":  {"label": "Milestone — Large",   "amount": 4999.0, "currency": "usd"},
+        "consultation":         {"label": "Design Consultation",  "amount": 49.0,   "currency": "inr"},
+        "site_visit_basic":     {"label": "Basic Site Visit",     "amount": 1000.0, "currency": "inr"},
+        "site_visit_standard":  {"label": "Standard Site Visit",  "amount": 1500.0, "currency": "inr"},
+        "site_visit_premium":   {"label": "Premium Site Visit",   "amount": 2500.0, "currency": "inr"},
+        "subscription_monthly": {"label": "Monthly Subscription", "amount": 149.0,  "currency": "inr"},
+        "subscription_yearly":  {"label": "Yearly Subscription",  "amount": 1499.0, "currency": "inr"},
+        "site_access_fee":      {"label": "Contractor Unlock Fee","amount": 49.0,   "currency": "inr"},
     },
     "seo": {
         "title": "SHP TEAM — Premium Construction & Interior Marketplace",
@@ -1547,6 +1556,17 @@ async def _get_or_init_site_config() -> dict:
         await db.site_config.insert_one(doc)
     doc.pop("_id", None)
     return doc
+
+async def _get_live_price(key: str, fallback: float) -> float:
+    """Reads a single price from the admin-editable site_config.pricing,
+    falling back to the hardcoded constant if it's missing or invalid.
+    This is the one place every booking/payment route should get its
+    amount from, so admin-panel edits actually take effect."""
+    cfg = await _get_or_init_site_config()
+    try:
+        return float((cfg.get("pricing") or {}).get(key, {}).get("amount", fallback))
+    except (TypeError, ValueError):
+        return fallback
 
 @api.get("/site-config")
 async def get_site_config():
