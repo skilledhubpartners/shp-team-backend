@@ -1321,9 +1321,10 @@ async def unlock_opportunity(opp_id: str, user: dict = Depends(get_current_user)
     if not opp:
         raise HTTPException(status_code=404, detail="Opportunity not found")
     
-    # Create Razorpay order
+    # Create Razorpay order using live price from admin config
+    unlock_amount = await _get_live_price("site_access_fee", SITE_ACCESS_FEE)
     order = razorpay_client.order.create({
-        "amount": int(SITE_ACCESS_FEE * 100),  # Convert to paise
+        "amount": int(unlock_amount * 100),  # Convert to paise
         "currency": "INR",
         "receipt": f"unlock_{opp_id[:20]}",
         "notes": {
@@ -1332,14 +1333,14 @@ async def unlock_opportunity(opp_id: str, user: dict = Depends(get_current_user)
             "type": "opportunity_unlock"
         }
     })
-    
-    # Store pending unlock
+
+    # Store pending unlock record
     unlock_doc = {
         "id": str(uuid.uuid4()),
         "opportunity_id": opp_id,
         "contractor_id": user["id"],
         "contractor_email": user["email"],
-        "amount": SITE_ACCESS_FEE,
+        "amount": unlock_amount,
         "currency": "INR",
         "razorpay_order_id": order["id"],
         "payment_status": "pending",
@@ -1354,42 +1355,55 @@ async def unlock_opportunity(opp_id: str, user: dict = Depends(get_current_user)
         "key_id": os.environ.get("RAZORPAY_KEY_ID")
     }
 
+class VerifyUnlockIn(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+
 @api.post("/opportunities/{opp_id}/verify-unlock")
 async def verify_unlock_payment(
     opp_id: str,
-    razorpay_order_id: str,
-    razorpay_payment_id: str,
-    razorpay_signature: str,
+    payload: VerifyUnlockIn,
     user: dict = Depends(get_current_user)
 ):
-    """Verify payment and unlock opportunity details"""
-    # Verify signature
+    """Verify Razorpay payment signature and mark opportunity as unlocked"""
+    # Step 1: Verify the Razorpay signature — this is the security check
+    # If signature is invalid, payment was tampered with → reject
     try:
         params_dict = {
-            'razorpay_order_id': razorpay_order_id,
-            'razorpay_payment_id': razorpay_payment_id,
-            'razorpay_signature': razorpay_signature
+            'razorpay_order_id': payload.razorpay_order_id,
+            'razorpay_payment_id': payload.razorpay_payment_id,
+            'razorpay_signature': payload.razorpay_signature
         }
         razorpay_client.utility.verify_payment_signature(params_dict)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Invalid payment signature")
-    
-    # Update unlock status
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid payment signature — payment verification failed")
+
+    # Step 2: Find the pending unlock record that matches this order
+    unlock_record = await db.opportunity_unlocks.find_one({
+        "razorpay_order_id": payload.razorpay_order_id,
+        "contractor_id": user["id"],
+        "opportunity_id": opp_id
+    })
+    if not unlock_record:
+        raise HTTPException(status_code=404, detail="Unlock request not found")
+
+    # Step 3: Mark as paid — ONLY after signature verification passes
     result = await db.opportunity_unlocks.update_one(
         {
-            "razorpay_order_id": razorpay_order_id,
+            "razorpay_order_id": payload.razorpay_order_id,
             "contractor_id": user["id"]
         },
         {"$set": {
             "payment_status": "paid",
-            "razorpay_payment_id": razorpay_payment_id,
+            "razorpay_payment_id": payload.razorpay_payment_id,
             "unlocked_at": datetime.now(timezone.utc).isoformat()
         }}
     )
-    
+
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Unlock request not found")
-    
+
     return {"status": "unlocked", "message": "Opportunity details unlocked successfully"}
 
 @api.post("/opportunities/{opp_id}/apply")
