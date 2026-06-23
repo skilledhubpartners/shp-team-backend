@@ -1299,8 +1299,8 @@ async def unlock_opportunity(opp_id: str, user: dict = Depends(get_current_user)
     """Contractor pays to unlock full opportunity details"""
     if user["role"] != "contractor":
         raise HTTPException(status_code=403, detail="Only contractors can unlock opportunities")
-    
-    # Check if already PAID to unlock (allow retry if previous attempt was cancelled/pending)
+
+    # Only block if there is already a PAID unlock — allow retry after cancel/fail
     existing_paid = await db.opportunity_unlocks.find_one({
         "opportunity_id": opp_id,
         "contractor_id": user["id"],
@@ -1309,32 +1309,46 @@ async def unlock_opportunity(opp_id: str, user: dict = Depends(get_current_user)
     if existing_paid:
         raise HTTPException(status_code=400, detail="Already unlocked")
 
-    # Clean up any stale pending unlock records before creating a new order
+    # Clean up stale pending/failed records so contractor can retry cleanly
     await db.opportunity_unlocks.delete_many({
         "opportunity_id": opp_id,
         "contractor_id": user["id"],
         "payment_status": {"$in": ["pending", "cancelled", "failed"]}
     })
-    
-    # Check if opportunity exists
-    opp = await db.opportunities.find_one({"id": opp_id}, {"_id": 0, "title": 1, "city": 1})
+
+    # Confirm opportunity exists
+    opp = await db.opportunities.find_one({"id": opp_id}, {"_id": 0, "title": 1})
     if not opp:
         raise HTTPException(status_code=404, detail="Opportunity not found")
-    
-    # Create Razorpay order using live price from admin config
-    unlock_amount = await _get_live_price("site_access_fee", SITE_ACCESS_FEE)
-    order = razorpay_client.order.create({
-        "amount": int(unlock_amount * 100),  # Convert to paise
-        "currency": "INR",
-        "receipt": f"unlock_{opp_id[:20]}",
-        "notes": {
-            "opportunity_id": opp_id,
-            "contractor_id": user["id"],
-            "type": "opportunity_unlock"
-        }
-    })
 
-    # Store pending unlock record
+    # Read live price from site_config, fall back to SITE_ACCESS_FEE constant
+    try:
+        cfg_doc = await db.site_config.find_one({"_id": "main"})
+        unlock_amount = float(
+            (cfg_doc or {}).get("pricing", {}).get("site_access_fee", {}).get("amount", SITE_ACCESS_FEE)
+        )
+    except Exception:
+        unlock_amount = SITE_ACCESS_FEE
+
+    # Create Razorpay order — wrap in try/except so API errors return a clean message
+    try:
+        order = razorpay_client.order.create({
+            "amount": int(unlock_amount * 100),  # paise
+            "currency": "INR",
+            "receipt": f"unlock_{opp_id[:20]}",
+            "notes": {
+                "opportunity_id": opp_id,
+                "contractor_id": user["id"],
+                "type": "opportunity_unlock"
+            }
+        })
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Payment gateway error — please try again. ({str(e)[:120]})"
+        )
+
+    # Save pending record
     unlock_doc = {
         "id": str(uuid.uuid4()),
         "opportunity_id": opp_id,
@@ -1347,10 +1361,10 @@ async def unlock_opportunity(opp_id: str, user: dict = Depends(get_current_user)
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     await db.opportunity_unlocks.insert_one(unlock_doc)
-    
+
     return {
         "razorpay_order_id": order["id"],
-        "amount": SITE_ACCESS_FEE,
+        "amount": unlock_amount,
         "currency": "INR",
         "key_id": os.environ.get("RAZORPAY_KEY_ID")
     }
