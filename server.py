@@ -30,7 +30,7 @@ import razorpay
 import hmac
 import hashlib
 
-from email_utils import send_notification_email, send_email_to, build_lead_email, build_booking_email, build_reset_email
+from email_utils import send_notification_email, send_email_to, build_lead_email, build_booking_email, build_reset_email, build_unlock_payment_email
 
 # ---------- Mongo ----------
 mongo_url = os.environ['MONGO_URL']
@@ -2160,6 +2160,117 @@ async def reject_user(user_id: str, _: dict = Depends(require_admin)):
 
 
 # ---------- Register router + CORS ----------
+@app.post("/api/webhooks/razorpay")
+async def razorpay_webhook(request: Request):
+    """
+    Razorpay calls this directly when payment is captured.
+    Bypasses the browser entirely — reliable even if customer closes tab.
+    Verified via HMAC-SHA256 using RAZORPAY_WEBHOOK_SECRET.
+    """
+    import hmac as hmac_lib
+    import hashlib
+    import json as json_lib
+
+    webhook_secret = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
+    if not webhook_secret:
+        logger.warning("RAZORPAY_WEBHOOK_SECRET not set; webhook ignored")
+        return {"status": "ignored"}
+
+    body_bytes = await request.body()
+    razorpay_sig = request.headers.get("x-razorpay-signature", "")
+    expected = hmac_lib.new(
+        webhook_secret.encode("utf-8"),
+        body_bytes,
+        hashlib.sha256
+    ).hexdigest()
+
+    if not hmac_lib.compare_digest(expected, razorpay_sig):
+        logger.warning("Razorpay webhook: invalid signature")
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+
+    try:
+        event = json_lib.loads(body_bytes)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    event_type = event.get("event", "")
+    logger.info("Razorpay webhook: %s", event_type)
+
+    if event_type in ("payment.captured", "order.paid"):
+        try:
+            if event_type == "payment.captured":
+                payment_entity     = event.get("payload", {}).get("payment", {}).get("entity", {})
+                razorpay_order_id  = payment_entity.get("order_id")
+                razorpay_payment_id = payment_entity.get("id")
+                amount_paise       = payment_entity.get("amount", 0)
+            else:
+                order_entity       = event.get("payload", {}).get("order", {}).get("entity", {})
+                payment_entity     = event.get("payload", {}).get("payment", {}).get("entity", {})
+                razorpay_order_id  = order_entity.get("id")
+                razorpay_payment_id = payment_entity.get("id", "")
+                amount_paise       = order_entity.get("amount", 0)
+
+            amount_rupees = amount_paise / 100
+
+            if not razorpay_order_id:
+                return {"status": "skipped", "reason": "no order_id"}
+
+            # Find matching opportunity unlock record
+            unlock_record = await db.opportunity_unlocks.find_one({
+                "razorpay_order_id": razorpay_order_id,
+                "payment_status": {"$ne": "paid"}
+            })
+
+            if not unlock_record:
+                logger.info("Webhook: no pending unlock for order %s", razorpay_order_id)
+                return {"status": "ok", "note": "not an opportunity unlock"}
+
+            # Mark as paid
+            await db.opportunity_unlocks.update_one(
+                {"razorpay_order_id": razorpay_order_id},
+                {"$set": {
+                    "payment_status": "paid",
+                    "razorpay_payment_id": razorpay_payment_id,
+                    "amount": amount_rupees,
+                    "unlocked_at": datetime.now(timezone.utc).isoformat(),
+                    "verified_via": "webhook"
+                }}
+            )
+            logger.info("Webhook: unlocked opportunity %s for %s via %s",
+                        unlock_record.get("opportunity_id"),
+                        unlock_record.get("contractor_email"),
+                        razorpay_payment_id)
+
+            # Fetch opportunity title and contractor name for email
+            opp = await db.opportunities.find_one(
+                {"id": unlock_record.get("opportunity_id")}, {"_id": 0, "title": 1}
+            )
+            contractor = await db.users.find_one(
+                {"id": unlock_record.get("contractor_id")}, {"_id": 0, "name": 1}
+            )
+
+            # Send alert email to admin
+            email_data = {
+                "amount":              amount_rupees,
+                "razorpay_payment_id": razorpay_payment_id,
+                "razorpay_order_id":   razorpay_order_id,
+                "opportunity_title":   (opp or {}).get("title", "Unknown"),
+                "opportunity_id":      unlock_record.get("opportunity_id"),
+                "contractor_email":    unlock_record.get("contractor_email"),
+                "contractor_name":     (contractor or {}).get("name", "Unknown"),
+                "unlocked_at":         datetime.now(timezone.utc).strftime("%d %b %Y, %I:%M %p UTC"),
+            }
+            subject, html = build_unlock_payment_email(email_data)
+            asyncio.create_task(send_notification_email(subject, html))
+
+        except Exception as e:
+            logger.error("Webhook processing error: %s", e)
+            # Always return 200 — otherwise Razorpay retries indefinitely
+            return {"status": "error", "detail": str(e)}
+
+    return {"status": "ok"}
+
+
 app.include_router(api)
 
 # CORS Origins - must explicitly list origins when using credentials
