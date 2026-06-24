@@ -154,3 +154,19 @@ def build_booking_email(booking: dict) -> tuple:
     )
     subject = f"{heading}: {booking.get('name', 'Customer')}"
     return subject, _wrap(heading, rows)
+
+
+def build_unlock_payment_email(unlock: dict) -> tuple:
+    """Alert email sent to admin when a contractor pays to unlock an opportunity."""
+    rows = (
+        _row("💰 Amount Paid",       f"₹{unlock.get('amount', 49)}")
+        + _row("Razorpay Payment ID", unlock.get("razorpay_payment_id"))
+        + _row("Razorpay Order ID",   unlock.get("razorpay_order_id"))
+        + _row("Opportunity",         unlock.get("opportunity_title"))
+        + _row("Opportunity ID",      unlock.get("opportunity_id"))
+        + _row("Contractor Email",    unlock.get("contractor_email"))
+        + _row("Contractor Name",     unlock.get("contractor_name"))
+        + _row("Paid At",             unlock.get("unlocked_at"))
+    )
+    subject = f"💰 Payment Received ₹{unlock.get('amount', 49)} — Opportunity Unlocked by {unlock.get('contractor_email', 'Contractor')}"
+    return subject, _wrap("New Opportunity Unlock Payment", rows)
