@@ -234,8 +234,6 @@ class WorkOpportunityIn(BaseModel):
     full_address: Optional[str] = None  # Hidden until unlocked
     status: OpportunityStatus = "open"
     deadline: Optional[str] = None  # YYYY-MM-DD
-    unlock_price: Optional[float] = None  # Custom unlock fee; None = use site default
-    unlock_price_reason: Optional[str] = None  # e.g. "Premium project", "High-value client"
 
 class OpportunityApplicationIn(BaseModel):
     opportunity_id: str
@@ -1319,19 +1317,16 @@ async def unlock_opportunity(opp_id: str, user: dict = Depends(get_current_user)
     })
 
     # Confirm opportunity exists
-    opp = await db.opportunities.find_one({"id": opp_id}, {"_id": 0, "title": 1, "unlock_price": 1, "unlock_price_reason": 1})
+    opp = await db.opportunities.find_one({"id": opp_id}, {"_id": 0, "title": 1})
     if not opp:
         raise HTTPException(status_code=404, detail="Opportunity not found")
 
-    # Use per-opportunity price if set, else site config default, else constant
+    # Read live price from site_config, fall back to SITE_ACCESS_FEE constant
     try:
-        if opp.get("unlock_price") and float(opp["unlock_price"]) > 0:
-            unlock_amount = float(opp["unlock_price"])
-        else:
-            cfg_doc = await db.site_config.find_one({"_id": "main"})
-            unlock_amount = float(
-                (cfg_doc or {}).get("pricing", {}).get("site_access_fee", {}).get("amount", SITE_ACCESS_FEE)
-            )
+        cfg_doc = await db.site_config.find_one({"_id": "main"})
+        unlock_amount = float(
+            (cfg_doc or {}).get("pricing", {}).get("site_access_fee", {}).get("amount", SITE_ACCESS_FEE)
+        )
     except Exception:
         unlock_amount = SITE_ACCESS_FEE
 
@@ -1452,19 +1447,6 @@ async def verify_unlock_payment(
     if not unlock_record:
         raise HTTPException(status_code=404, detail="Unlock request not found. Please contact support.")
 
-    # --- Generate Assign ID (SHP-YYYY-NNN auto-incremented) ---
-    year = datetime.now(timezone.utc).year
-    counter_doc = await db.assign_id_counter.find_one_and_update(
-        {"_id": f"shp_{year}"},
-        {"$inc": {"seq": 1}},
-        upsert=True,
-        return_document=True
-    )
-    seq = counter_doc["seq"] if counter_doc else 1
-    assign_id = f"SHP-{year}-{str(seq).zfill(3)}"
-
-    now_iso = datetime.now(timezone.utc).isoformat()
-
     # --- Mark as paid ---
     await db.opportunity_unlocks.update_one(
         {
@@ -1475,27 +1457,11 @@ async def verify_unlock_payment(
             "payment_status": "paid",
             "razorpay_payment_id": payload.razorpay_payment_id,
             "razorpay_signature": payload.razorpay_signature,
-            "unlocked_at": now_iso,
-            "assign_id": assign_id,
-            "approval_status": "pending"
+            "unlocked_at": datetime.now(timezone.utc).isoformat()
         }}
     )
 
-    # --- Get opportunity details (without client info) for response ---
-    opp_details = await db.opportunities.find_one(
-        {"id": opp_id},
-        {"_id": 0, "title": 1, "location": 1, "city": 1, "estimated_budget": 1,
-         "estimated_duration": 1, "opportunity_type": 1, "description": 1,
-         "scope_of_work": 1, "requirements": 1, "skills_needed": 1}
-    )
-
-    return {
-        "status": "unlocked",
-        "assign_id": assign_id,
-        "approval_status": "pending",
-        "unlocked_at": now_iso,
-        "opportunity": opp_details or {}
-    }
+    return {"status": "unlocked", "message": "Opportunity unlocked successfully"}
 
 @api.post("/opportunities/{opp_id}/apply")
 async def apply_to_opportunity(opp_id: str, payload: OpportunityApplicationIn, user: dict = Depends(get_current_user)):
@@ -1553,105 +1519,6 @@ async def apply_to_opportunity(opp_id: str, payload: OpportunityApplicationIn, u
     })
     
     return {"id": app_id, "message": "Application submitted successfully"}
-
-# ---------- Track by Assign ID (public) ----------
-@api.get("/track/{assign_id}")
-async def track_by_assign_id(assign_id: str):
-    """Anyone with an Assign ID can check their status — no auth needed"""
-    unlock = await db.opportunity_unlocks.find_one(
-        {"assign_id": assign_id.upper()},
-        {"_id": 0, "opportunity_id": 1, "contractor_id": 1, "unlocked_at": 1,
-         "approval_status": 1, "amount": 1, "assign_id": 1}
-    )
-    if not unlock:
-        raise HTTPException(status_code=404, detail="Assign ID not found. Please check and try again.")
-
-    opp = await db.opportunities.find_one(
-        {"id": unlock["opportunity_id"]},
-        {"_id": 0, "title": 1, "location": 1, "city": 1, "estimated_budget": 1,
-         "estimated_duration": 1, "opportunity_type": 1, "description": 1,
-         "scope_of_work": 1, "requirements": 1, "skills_needed": 1,
-         # Only reveal client info if approved
-         "client_name": 1, "client_phone": 1, "client_email": 1, "full_address": 1}
-    )
-    if not opp:
-        raise HTTPException(status_code=404, detail="Opportunity not found.")
-
-    approval_status = unlock.get("approval_status", "pending")
-
-    # Only expose client info once admin has approved
-    if approval_status != "approved":
-        opp.pop("client_name", None)
-        opp.pop("client_phone", None)
-        opp.pop("client_email", None)
-        opp.pop("full_address", None)
-
-    return {
-        "assign_id": unlock["assign_id"],
-        "approval_status": approval_status,
-        "unlocked_at": unlock["unlocked_at"],
-        "opportunity": opp
-    }
-
-# ---------- Admin: approve/reject assign ID ----------
-class AssignApprovalIn(BaseModel):
-    status: Literal["approved", "rejected", "in_discussion"]
-    admin_note: Optional[str] = None
-
-@api.put("/admin/assign/{assign_id}/status")
-async def update_assign_status(assign_id: str, payload: AssignApprovalIn, _: dict = Depends(require_admin)):
-    """Admin approves/rejects a contractor's assign ID"""
-    result = await db.opportunity_unlocks.update_one(
-        {"assign_id": assign_id.upper()},
-        {"$set": {
-            "approval_status": payload.status,
-            "admin_note": payload.admin_note,
-            "status_updated_at": datetime.now(timezone.utc).isoformat()
-        }}
-    )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Assign ID not found")
-
-    # If approved, mark the opportunity as assigned
-    if payload.status == "approved":
-        unlock = await db.opportunity_unlocks.find_one({"assign_id": assign_id.upper()})
-        if unlock:
-            await db.opportunities.update_one(
-                {"id": unlock["opportunity_id"]},
-                {"$set": {"status": "assigned", "assigned_contractor_id": unlock["contractor_id"]}}
-            )
-
-    return {"message": f"Assign ID {assign_id} status updated to {payload.status}"}
-
-@api.get("/admin/assign-ids")
-async def list_assign_ids(_: dict = Depends(require_admin), status: Optional[str] = None):
-    """Admin lists all assign IDs with contractor and opportunity info"""
-    query = {"payment_status": "paid", "assign_id": {"$exists": True}}
-    if status:
-        query["approval_status"] = status
-
-    records = []
-    async for doc in db.opportunity_unlocks.find(query, {"_id": 0}).sort("unlocked_at", -1).limit(200):
-        # Get opportunity title
-        opp = await db.opportunities.find_one(
-            {"id": doc["opportunity_id"]},
-            {"_id": 0, "title": 1, "city": 1, "opportunity_type": 1}
-        )
-        if opp:
-            doc["opportunity_title"] = opp["title"]
-            doc["opportunity_city"] = opp.get("city", "")
-            doc["opportunity_type"] = opp.get("opportunity_type", "")
-        # Get contractor name
-        contractor = await db.users.find_one(
-            {"id": doc["contractor_id"]},
-            {"_id": 0, "name": 1, "phone": 1, "email": 1}
-        )
-        if contractor:
-            doc["contractor_name"] = contractor.get("name", "")
-            doc["contractor_phone"] = contractor.get("phone", "")
-            doc["contractor_email"] = contractor.get("email", "")
-        records.append(doc)
-    return records
 
 @api.get("/my-opportunity-applications")
 async def get_my_applications(user: dict = Depends(get_current_user)):
