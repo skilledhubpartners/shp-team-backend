@@ -170,3 +170,49 @@ def build_unlock_payment_email(unlock: dict) -> tuple:
     )
     subject = f"💰 Payment Received ₹{unlock.get('amount', 49)} — Opportunity Unlocked by {unlock.get('contractor_email', 'Contractor')}"
     return subject, _wrap("New Opportunity Unlock Payment", rows)
+
+
+def build_assign_id_email(data: dict) -> tuple:
+    """Email sent to contractor after payment — delivers Assign ID and project summary."""
+    assign_id = data.get("assign_id", "N/A")
+    contractor_name = data.get("contractor_name", "Contractor")
+    opp_title = data.get("opportunity_title", "Opportunity")
+    opp_type = (data.get("opportunity_type") or "").replace("_", " ").title()
+    city = data.get("city", "")
+    budget = data.get("estimated_budget")
+    duration = data.get("estimated_duration", "")
+
+    budget_row = _row("Estimated Budget", f"₹{int(budget):,}") if budget else ""
+
+    rows = (
+        f'<tr><td colspan="2" style="padding:8px 0 4px;">'
+        f'<div style="background:#0f172a;border-radius:10px;padding:18px;text-align:center;margin-bottom:12px;">'
+        f'<div style="font-size:11px;color:#94a3b8;letter-spacing:2px;text-transform:uppercase;margin-bottom:4px;">Your Assign ID</div>'
+        f'<div style="font-size:32px;font-weight:900;color:#D4AF37;font-family:monospace;letter-spacing:6px;">{assign_id}</div>'
+        f'<div style="font-size:11px;color:#64748b;margin-top:4px;">Save this — use it to track your status at shpteam.in/track</div>'
+        f'</div></td></tr>'
+        + f'<tr><td colspan="2" style="padding:4px 0 8px;color:#475569;font-size:14px;">Hi <strong>{contractor_name}</strong>, your payment is confirmed and you\'ve been assigned to the opportunity below. Our team will be in touch shortly.</td></tr>'
+        + _row("Project Title", opp_title)
+        + _row("Type", opp_type)
+        + _row("City", city)
+        + _row("Duration", duration)
+        + budget_row
+        + f'<tr><td colspan="2" style="padding:14px 0 4px;">'
+        f'<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:14px;">'
+        f'<div style="font-size:12px;font-weight:700;color:#1e40af;margin-bottom:8px;">WHAT HAPPENS NEXT</div>'
+        f'<ol style="margin:0;padding-left:18px;color:#3730a3;font-size:13px;line-height:1.8;">'
+        f'<li>Our team reviews your profile against client requirements</li>'
+        f'<li>We discuss the opportunity with the client on your behalf</li>'
+        f'<li>If approved, you\'ll receive the client\'s full contact details</li>'
+        f'<li>You connect directly with the client to finalise the work</li>'
+        f'</ol></div></td></tr>'
+        + f'<tr><td colspan="2" style="padding:14px 0 4px;text-align:center;">'
+        f'<a href="https://shpteam.in/track" style="background:#D4AF37;color:#0f172a;font-weight:700;'
+        f'text-decoration:none;padding:12px 28px;border-radius:9999px;display:inline-block;font-size:14px;">'
+        f'Track Your Status →</a>'
+        f'<div style="margin-top:8px;font-size:12px;color:#94a3b8;">Enter Assign ID: <strong style="font-family:monospace;color:#0f172a;">{assign_id}</strong></div>'
+        f'</td></tr>'
+    )
+
+    subject = f"[SHP TEAM] Your Assign ID: {assign_id} — {opp_title}"
+    return subject, _wrap(f"You're Assigned! 🎉", rows)
