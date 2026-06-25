@@ -1169,11 +1169,15 @@ async def list_opportunities_admin(_: dict = Depends(require_admin), status: Opt
     
     opportunities = []
     async for doc in db.opportunities.find(query, {"_id": 0}).sort("created_at", -1).limit(200):
-        # Get applications count
-        app_count = await db.opportunity_applications.count_documents({"opportunity_id": doc["id"]})
-        doc["applications_count"] = app_count
+        # Count paid unlocks (real applicants)
+        unlock_count = await db.opportunity_unlocks.count_documents({
+            "opportunity_id": doc["id"],
+            "payment_status": "paid"
+        })
+        doc["unlock_count"] = unlock_count
+        doc["applications_count"] = unlock_count  # keep for compatibility
         opportunities.append(doc)
-    
+
     return opportunities
 
 @api.get("/admin/opportunities/{opp_id}")
