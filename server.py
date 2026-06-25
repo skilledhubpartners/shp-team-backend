@@ -255,6 +255,10 @@ class ApproveContractorIn(BaseModel):
     contractor_id: str
     opportunity_id: str
 
+class SetOpportunityStatusIn(BaseModel):
+    status: str
+    assigned_contractor_id: Optional[str] = None
+
 # Site access fee for contractors
 SITE_ACCESS_FEE = 49.0
 
