@@ -30,7 +30,7 @@ import razorpay
 import hmac
 import hashlib
 
-from email_utils import send_notification_email, send_email_to, build_lead_email, build_booking_email, build_reset_email, build_unlock_payment_email, build_assign_id_email
+from email_utils import send_notification_email, send_email_to, build_lead_email, build_booking_email, build_reset_email, build_unlock_payment_email, build_assign_id_email, build_commission_offer_email, build_rejection_wallet_credit_email
 
 # ---------- Mongo ----------
 mongo_url = os.environ['MONGO_URL']
@@ -86,6 +86,7 @@ class UserPublic(BaseModel):
     phone: Optional[str] = None
     city: Optional[str] = None
     created_at: datetime
+    wallet_balance: float = 0.0
 
 class RegisterIn(BaseModel):
     email: EmailStr; password: str = Field(min_length=6); name: str = Field(min_length=2)
@@ -215,7 +216,7 @@ SITE_VISIT_PACKAGES = {
 
 # ---------- Work Opportunities Models ----------
 OpportunityType = Literal["daily_work", "site_visit", "project"]
-OpportunityStatus = Literal["open", "in_discussion", "approved", "rejected", "completed", "assigned", "cancelled"]
+OpportunityStatus = Literal["open", "assigned", "completed", "cancelled"]
 
 class WorkOpportunityIn(BaseModel):
     title: str
@@ -234,19 +235,25 @@ class WorkOpportunityIn(BaseModel):
     full_address: Optional[str] = None  # Hidden until unlocked
     status: OpportunityStatus = "open"
     deadline: Optional[str] = None  # YYYY-MM-DD
-    unlock_price: float = 49.0          # Per-opportunity unlock price
-    unlock_price_reason: Optional[str] = None  # Why this price
-    max_applicants: int = 5             # Max contractors who can unlock
-
-class SetOpportunityStatusIn(BaseModel):
-    status: OpportunityStatus
-    assigned_contractor_id: Optional[str] = None
 
 class OpportunityApplicationIn(BaseModel):
     opportunity_id: str
     cover_letter: Optional[str] = None
     proposed_budget: Optional[float] = None
     proposed_timeline: Optional[str] = None
+
+class CommissionOfferIn(BaseModel):
+    commission_type: str  # "percent" or "amount"
+    commission_value: float  # e.g. 10 (for 10%) or 5000 (for ₹5000)
+    note: Optional[str] = None  # optional message to admin
+
+class RejectContractorIn(BaseModel):
+    contractor_id: str
+    opportunity_id: str
+
+class ApproveContractorIn(BaseModel):
+    contractor_id: str
+    opportunity_id: str
 
 # Site access fee for contractors
 SITE_ACCESS_FEE = 49.0
@@ -1220,58 +1227,50 @@ async def list_all_applications(_: dict = Depends(require_admin)):
 
 # ---------- Work Opportunities: Contractor ----------
 @api.get("/opportunities")
-async def list_opportunities(user: dict = Depends(get_current_user), opportunity_type: Optional[str] = None):
-    """Contractors list available opportunities — only open, not yet at max applicants, not approved for someone else"""
+async def list_opportunities(user: dict = Depends(get_current_user), status: str = "open", opportunity_type: Optional[str] = None):
+    """Contractors list available opportunities"""
     if user["role"] != "contractor":
         raise HTTPException(status_code=403, detail="Only contractors can view opportunities")
-
-    query = {"status": "open"}
+    
+    query = {"status": status}
     if opportunity_type:
         query["opportunity_type"] = opportunity_type
-
+    
     opportunities = []
     async for doc in db.opportunities.find(query, {"_id": 0}).sort("created_at", -1).limit(100):
         opp_id = doc["id"]
-
-        # Count how many unique contractors have PAID to unlock
-        unlock_count = await db.opportunity_unlocks.count_documents({
-            "opportunity_id": opp_id,
-            "payment_status": "paid"
-        })
-        max_ap = doc.get("max_applicants", 5)
-
-        # Check if this contractor already unlocked
-        my_unlock = await db.opportunity_unlocks.find_one({
+        # Check if contractor has PAID to unlock
+        unlock = await db.opportunity_unlocks.find_one({
             "opportunity_id": opp_id,
             "contractor_id": user["id"],
             "payment_status": "paid"
         })
 
-        # Skip if max reached and this contractor hasn't unlocked (no new unlocks allowed)
-        if unlock_count >= max_ap and not my_unlock:
-            continue
+        # ALWAYS hide client info initially
+        doc["client_name"] = None
+        doc["client_phone"] = None
+        doc["client_email"] = None
+        doc["full_address"] = None
 
-        if not my_unlock:
-            doc["client_name"] = "***LOCKED***"
-            doc["client_phone"] = "***LOCKED***"
-            doc["client_email"] = "***LOCKED***"
-            doc["full_address"] = "***LOCKED***"
+        if not unlock:
             doc["is_locked"] = True
+            doc["application_status"] = None
+            doc["commission_offer"] = None
+            doc["assign_id"] = None
         else:
             doc["is_locked"] = False
-            doc["unlocked_at"] = my_unlock.get("unlocked_at")
-            doc["assign_id"] = my_unlock.get("assign_id")
+            doc["unlocked_at"] = unlock.get("unlocked_at")
+            doc["assign_id"] = unlock.get("assign_id")
+            doc["application_status"] = unlock.get("status", "applied")
+            doc["commission_offer"] = unlock.get("commission_offer")
+            # ONLY show client info if this contractor is the approved winner
+            if unlock.get("status") == "approved":
+                full_opp = await db.opportunities.find_one({"id": opp_id}, {"_id": 0})
+                doc["client_name"] = full_opp.get("client_name")
+                doc["client_phone"] = full_opp.get("client_phone")
+                doc["client_email"] = full_opp.get("client_email")
+                doc["full_address"] = full_opp.get("full_address")
 
-        # Check if contractor has applied
-        application = await db.opportunity_applications.find_one({
-            "opportunity_id": opp_id,
-            "contractor_id": user["id"]
-        })
-        doc["has_applied"] = bool(application)
-        if application:
-            doc["application_status"] = application.get("status", "pending")
-
-        doc["slots_remaining"] = max(0, max_ap - unlock_count)
         opportunities.append(doc)
 
     return opportunities
@@ -1317,45 +1316,123 @@ async def get_opportunity(opp_id: str, user: dict = Depends(get_current_user)):
 
 @api.post("/opportunities/{opp_id}/unlock")
 async def unlock_opportunity(opp_id: str, user: dict = Depends(get_current_user)):
-    """Contractor pays to unlock full opportunity details"""
+    """Contractor pays ₹49 (or wallet credit) to apply — sees project details + Assign ID.
+    Client info is NEVER shown at this stage. Admin reviews all applicants, picks the best
+    commission offer, and only the winner gets client details. Losers get wallet credit back.
+    """
     if user["role"] != "contractor":
         raise HTTPException(status_code=403, detail="Only contractors can unlock opportunities")
 
-    # Only block if there is already a PAID unlock — allow retry after cancel/fail
     existing_paid = await db.opportunity_unlocks.find_one({
         "opportunity_id": opp_id,
         "contractor_id": user["id"],
         "payment_status": "paid"
     })
     if existing_paid:
-        raise HTTPException(status_code=400, detail="Already unlocked")
+        raise HTTPException(status_code=400, detail="Already applied to this opportunity")
 
-    # Clean up stale pending/failed records so contractor can retry cleanly
+    # Get opportunity — check it exists and has slots
+    opp = await db.opportunities.find_one({"id": opp_id}, {"_id": 0})
+    if not opp:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+    if opp.get("status") != "open":
+        raise HTTPException(status_code=400, detail="This opportunity is no longer accepting applications")
+
+    # Check max_applicants
+    paid_count = await db.opportunity_unlocks.count_documents({
+        "opportunity_id": opp_id, "payment_status": "paid"
+    })
+    max_ap = opp.get("max_applicants", 5)
+    if paid_count >= max_ap:
+        raise HTTPException(status_code=400, detail=f"This opportunity has reached its maximum of {max_ap} applicants")
+
+    # Clean up stale records
     await db.opportunity_unlocks.delete_many({
         "opportunity_id": opp_id,
         "contractor_id": user["id"],
         "payment_status": {"$in": ["pending", "cancelled", "failed"]}
     })
 
-    # Confirm opportunity exists
-    opp = await db.opportunities.find_one({"id": opp_id}, {"_id": 0, "title": 1})
-    if not opp:
-        raise HTTPException(status_code=404, detail="Opportunity not found")
+    unlock_amount = float(opp.get("unlock_price") or SITE_ACCESS_FEE)
 
-    # Use opportunity's own unlock_price; fall back to SITE_ACCESS_FEE
-    opp_full = await db.opportunities.find_one({"id": opp_id}, {"_id": 0, "unlock_price": 1, "max_applicants": 1})
-    if not opp_full:
-        raise HTTPException(status_code=404, detail="Opportunity not found")
-    unlock_amount = float(opp_full.get("unlock_price") or SITE_ACCESS_FEE)
+    # ---- WALLET PAYMENT PATH ----
+    # If contractor has enough wallet balance, deduct and mark paid immediately
+    contractor_doc = await db.users.find_one({"id": user["id"]}, {"_id": 0, "wallet_balance": 1})
+    wallet_balance = float(contractor_doc.get("wallet_balance") or 0)
 
-    # Check max_applicants not exceeded
-    unlock_count = await db.opportunity_unlocks.count_documents({
-        "opportunity_id": opp_id,
-        "payment_status": "paid"
-    })
-    max_ap = opp_full.get("max_applicants", 5)
-    if unlock_count >= max_ap:
-        raise HTTPException(status_code=400, detail="This opportunity has reached its maximum number of applicants.")
+    if wallet_balance >= unlock_amount:
+        # Deduct from wallet
+        new_balance = round(wallet_balance - unlock_amount, 2)
+        await db.users.update_one({"id": user["id"]}, {"$set": {"wallet_balance": new_balance}})
+
+        # Generate assign_id
+        year = datetime.now(timezone.utc).year
+        seq_count = await db.opportunity_unlocks.count_documents({"assign_id": {"$regex": f"^SHP-{year}-"}})
+        assign_id = f"SHP-{year}-{seq_count + 1:03d}"
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Save wallet transaction log
+        await db.wallet_transactions.insert_one({
+            "id": str(uuid.uuid4()),
+            "contractor_id": user["id"],
+            "type": "debit",
+            "amount": unlock_amount,
+            "balance_after": new_balance,
+            "reason": f"Opportunity unlock: {opp.get('title')}",
+            "opportunity_id": opp_id,
+            "created_at": now_iso
+        })
+
+        unlock_doc = {
+            "id": str(uuid.uuid4()),
+            "opportunity_id": opp_id,
+            "contractor_id": user["id"],
+            "contractor_email": user["email"],
+            "amount": unlock_amount,
+            "currency": "INR",
+            "razorpay_order_id": None,
+            "payment_status": "paid",
+            "payment_method": "wallet",
+            "assign_id": assign_id,
+            "commission_offer": None,
+            "status": "applied",
+            "unlocked_at": now_iso,
+            "created_at": now_iso
+        }
+        await db.opportunity_unlocks.insert_one(unlock_doc)
+
+        # Send assign ID email
+        try:
+            subject, html = build_assign_id_email({
+                "assign_id": assign_id,
+                "contractor_name": user.get("name", user["email"]),
+                "contractor_email": user["email"],
+                "opportunity_title": opp.get("title", ""),
+                "opportunity_type": opp.get("opportunity_type", ""),
+                "city": opp.get("city", ""),
+                "estimated_budget": opp.get("estimated_budget"),
+                "estimated_duration": opp.get("estimated_duration", ""),
+                "unlocked_at": now_iso,
+            })
+            await send_email_to(user["email"], subject, html)
+        except Exception as e:
+            logging.warning("assign_id email failed: %s", e)
+
+        return {
+            "paid_via": "wallet",
+            "assign_id": assign_id,
+            "wallet_balance_remaining": new_balance,
+            "opportunity": {
+                "title": opp.get("title"),
+                "description": opp.get("description"),
+                "scope_of_work": opp.get("scope_of_work"),
+                "location": opp.get("location"),
+                "city": opp.get("city"),
+                "estimated_duration": opp.get("estimated_duration"),
+                "estimated_budget": opp.get("estimated_budget"),
+                "skills_needed": opp.get("skills_needed"),
+            }
+        }
 
     # Create Razorpay order — wrap in try/except so API errors return a clean message
     try:
@@ -1474,18 +1551,13 @@ async def verify_unlock_payment(
     if not unlock_record:
         raise HTTPException(status_code=404, detail="Unlock request not found. Please contact support.")
 
-    # --- Generate assign_id (SHP-YYYY-NNN) ---
+    # --- Generate assign_id ---
     year = datetime.now(timezone.utc).year
-    # Count existing assign_ids for this year to get next sequence
-    existing_count = await db.opportunity_unlocks.count_documents({
-        "assign_id": {"$regex": f"^SHP-{year}-"},
-        "payment_status": "paid"
-    })
-    seq = existing_count + 1
-    assign_id = f"SHP-{year}-{seq:03d}"
+    seq_count = await db.opportunity_unlocks.count_documents({"assign_id": {"$regex": f"^SHP-{year}-"}})
+    assign_id = f"SHP-{year}-{seq_count + 1:03d}"
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     # --- Mark as paid ---
-    now_iso = datetime.now(timezone.utc).isoformat()
     await db.opportunity_unlocks.update_one(
         {
             "razorpay_order_id": payload.razorpay_order_id,
@@ -1493,167 +1565,258 @@ async def verify_unlock_payment(
         },
         {"$set": {
             "payment_status": "paid",
+            "payment_method": "razorpay",
             "razorpay_payment_id": payload.razorpay_payment_id,
             "razorpay_signature": payload.razorpay_signature,
-            "unlocked_at": now_iso,
             "assign_id": assign_id,
-            "status": "paid"  # unlock-level status
+            "commission_offer": None,
+            "status": "applied",
+            "unlocked_at": now_iso
         }}
     )
 
-    # --- Send Assign ID email to contractor ---
+    # --- Get full opportunity details (NO client info) ---
+    opp_full = await db.opportunities.find_one({"id": opp_id}, {"_id": 0})
+
+    # --- Send assign ID email ---
     try:
-        opp_for_email = await db.opportunities.find_one({"id": opp_id}, {"_id": 0})
-        if opp_for_email:
-            subject, html = build_assign_id_email({
-                "assign_id": assign_id,
-                "contractor_name": user.get("name", user["email"]),
-                "contractor_email": user["email"],
-                "opportunity_title": opp_for_email.get("title", ""),
-                "opportunity_type": opp_for_email.get("opportunity_type", ""),
-                "city": opp_for_email.get("city", ""),
-                "estimated_budget": opp_for_email.get("estimated_budget"),
-                "estimated_duration": opp_for_email.get("estimated_duration", ""),
-                "unlocked_at": now_iso,
-            })
-            await send_email_to(user["email"], subject, html)
+        subject, html = build_assign_id_email({
+            "assign_id": assign_id,
+            "contractor_name": user.get("name", user["email"]),
+            "contractor_email": user["email"],
+            "opportunity_title": opp_full.get("title", ""),
+            "opportunity_type": opp_full.get("opportunity_type", ""),
+            "city": opp_full.get("city", ""),
+            "estimated_budget": opp_full.get("estimated_budget"),
+            "estimated_duration": opp_full.get("estimated_duration", ""),
+            "unlocked_at": now_iso,
+        })
+        await send_email_to(user["email"], subject, html)
     except Exception as e:
-        logging.warning("Failed to send assign_id email: %s", str(e))
+        logging.warning("assign_id email failed: %s", e)
 
-    return {"status": "unlocked", "message": "Opportunity unlocked successfully", "assign_id": assign_id}
+    return {
+        "status": "applied",
+        "assign_id": assign_id,
+        "opportunity": {
+            "title": opp_full.get("title"),
+            "description": opp_full.get("description"),
+            "scope_of_work": opp_full.get("scope_of_work"),
+            "location": opp_full.get("location"),
+            "city": opp_full.get("city"),
+            "estimated_duration": opp_full.get("estimated_duration"),
+            "estimated_budget": opp_full.get("estimated_budget"),
+            "skills_needed": opp_full.get("skills_needed"),
+            "requirements": opp_full.get("requirements"),
+        }
+    }
 
-@api.post("/opportunities/{opp_id}/apply")
-async def apply_to_opportunity(opp_id: str, payload: OpportunityApplicationIn, user: dict = Depends(get_current_user)):
-    """Contractor applies to an opportunity"""
+@api.post("/opportunities/{opp_id}/commission-offer")
+async def submit_commission_offer(opp_id: str, payload: CommissionOfferIn, user: dict = Depends(get_current_user)):
+    """Contractor submits their commission offer after paying the unlock fee.
+    Can be submitted or updated anytime while status is 'applied'.
+    Admin sees all offers and selects the best one.
+    """
     if user["role"] != "contractor":
-        raise HTTPException(status_code=403, detail="Only contractors can apply")
-    
-    # Check if opportunity exists
-    opp = await db.opportunities.find_one({"id": opp_id}, {"_id": 0, "title": 1, "status": 1})
-    if not opp:
-        raise HTTPException(status_code=404, detail="Opportunity not found")
-    
-    if opp["status"] != "open":
-        raise HTTPException(status_code=400, detail="Opportunity is not open for applications")
-    
-    # Check if already applied
-    existing = await db.opportunity_applications.find_one({
-        "opportunity_id": opp_id,
-        "contractor_id": user["id"]
-    })
-    if existing:
-        raise HTTPException(status_code=400, detail="Already applied to this opportunity")
-    
-    # Create application
-    app_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc)
-    
-    app_doc = {
-        "id": app_id,
+        raise HTTPException(status_code=403, detail="Only contractors can submit offers")
+
+    # Must have paid unlock first
+    unlock = await db.opportunity_unlocks.find_one({
         "opportunity_id": opp_id,
         "contractor_id": user["id"],
-        "contractor_email": user["email"],
-        "contractor_name": user.get("name", ""),
-        "cover_letter": payload.cover_letter,
-        "proposed_budget": payload.proposed_budget,
-        "proposed_timeline": payload.proposed_timeline,
-        "status": "pending",
-        "created_at": now.isoformat()
+        "payment_status": "paid"
+    })
+    if not unlock:
+        raise HTTPException(status_code=400, detail="You must unlock this opportunity before submitting a commission offer")
+
+    if unlock.get("status") == "rejected":
+        raise HTTPException(status_code=400, detail="You were not selected for this opportunity")
+
+    if payload.commission_type not in ("percent", "amount"):
+        raise HTTPException(status_code=400, detail="commission_type must be 'percent' or 'amount'")
+
+    if payload.commission_type == "percent" and not (0 < payload.commission_value <= 50):
+        raise HTTPException(status_code=400, detail="Commission percentage must be between 0.1% and 50%")
+
+    if payload.commission_type == "amount" and payload.commission_value <= 0:
+        raise HTTPException(status_code=400, detail="Commission amount must be positive")
+
+    commission_offer = {
+        "type": payload.commission_type,
+        "value": payload.commission_value,
+        "note": payload.note or "",
+        "submitted_at": datetime.now(timezone.utc).isoformat()
     }
-    
-    await db.opportunity_applications.insert_one(app_doc)
-    
-    # Increment applications count
+
+    await db.opportunity_unlocks.update_one(
+        {"opportunity_id": opp_id, "contractor_id": user["id"]},
+        {"$set": {"commission_offer": commission_offer, "status": "offer_submitted"}}
+    )
+
+    # Notify admin
+    opp = await db.opportunities.find_one({"id": opp_id}, {"_id": 0, "title": 1})
+    offer_display = f"{payload.commission_value}%" if payload.commission_type == "percent" else f"₹{payload.commission_value:,.0f}"
+    await hub.broadcast("admin", {
+        "type": "opportunity.commission_offer",
+        "title": "New Commission Offer",
+        "body": f"{user.get('name', 'A contractor')} offered {offer_display} commission for {opp.get('title', '')}",
+        "at": datetime.now(timezone.utc).isoformat()
+    })
+
+    # Email admin
+    try:
+        subject, html = build_commission_offer_email({
+            "contractor_name": user.get("name", user["email"]),
+            "contractor_email": user["email"],
+            "opportunity_title": opp.get("title", ""),
+            "commission_type": payload.commission_type,
+            "commission_value": payload.commission_value,
+            "note": payload.note or "",
+            "assign_id": unlock.get("assign_id", ""),
+        })
+        await send_notification_email(subject, html)
+    except Exception as e:
+        logging.warning("commission offer email failed: %s", e)
+
+    return {"message": "Commission offer submitted successfully", "offer": commission_offer}
+
+
+@api.post("/admin/opportunities/{opp_id}/select-contractor")
+async def select_contractor(opp_id: str, payload: ApproveContractorIn, _: dict = Depends(require_admin)):
+    """Admin selects the winning contractor:
+    - Winner: gets client info revealed, status -> approved
+    - All others: status -> rejected, ₹49 credited to their wallet
+    """
+    opp = await db.opportunities.find_one({"id": opp_id}, {"_id": 0})
+    if not opp:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+
+    # Get ALL paid applicants for this opportunity
+    all_unlocks = []
+    async for u in db.opportunity_unlocks.find({"opportunity_id": opp_id, "payment_status": "paid"}, {"_id": 0}):
+        all_unlocks.append(u)
+
+    winner_unlock = next((u for u in all_unlocks if u["contractor_id"] == payload.contractor_id), None)
+    if not winner_unlock:
+        raise HTTPException(status_code=404, detail="Selected contractor has not applied to this opportunity")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    refund_amount = float(opp.get("unlock_price") or SITE_ACCESS_FEE)
+
+    for unlock in all_unlocks:
+        if unlock["contractor_id"] == payload.contractor_id:
+            # WINNER — mark approved
+            await db.opportunity_unlocks.update_one(
+                {"id": unlock["id"]},
+                {"$set": {"status": "approved", "approved_at": now_iso}}
+            )
+        else:
+            # LOSER — mark rejected + credit wallet
+            await db.opportunity_unlocks.update_one(
+                {"id": unlock["id"]},
+                {"$set": {"status": "rejected", "rejected_at": now_iso}}
+            )
+            # Add wallet credit
+            contractor_doc = await db.users.find_one({"id": unlock["contractor_id"]}, {"_id": 0, "wallet_balance": 1, "email": 1, "name": 1})
+            old_balance = float((contractor_doc or {}).get("wallet_balance") or 0)
+            new_balance = round(old_balance + refund_amount, 2)
+            await db.users.update_one(
+                {"id": unlock["contractor_id"]},
+                {"$set": {"wallet_balance": new_balance}}
+            )
+            # Log wallet credit transaction
+            await db.wallet_transactions.insert_one({
+                "id": str(uuid.uuid4()),
+                "contractor_id": unlock["contractor_id"],
+                "type": "credit",
+                "amount": refund_amount,
+                "balance_after": new_balance,
+                "reason": f"Refund — not selected for: {opp.get('title', '')}",
+                "opportunity_id": opp_id,
+                "created_at": now_iso
+            })
+            # Email rejected contractor
+            try:
+                contractor_email = (contractor_doc or {}).get("email", unlock.get("contractor_email", ""))
+                contractor_name = (contractor_doc or {}).get("name", "Contractor")
+                if contractor_email:
+                    subject, html = build_rejection_wallet_credit_email({
+                        "contractor_name": contractor_name,
+                        "opportunity_title": opp.get("title", ""),
+                        "refund_amount": refund_amount,
+                        "new_wallet_balance": new_balance,
+                        "assign_id": unlock.get("assign_id", ""),
+                    })
+                    await send_email_to(contractor_email, subject, html)
+            except Exception as e:
+                logging.warning("rejection email failed for %s: %s", unlock["contractor_id"], e)
+
+    # Update opportunity status to approved + record winner
     await db.opportunities.update_one(
         {"id": opp_id},
-        {"$inc": {"applications_count": 1}}
+        {"$set": {
+            "status": "approved",
+            "assigned_contractor_id": payload.contractor_id,
+            "assigned_at": now_iso,
+            "updated_at": now_iso
+        }}
     )
-    
-    # Notify admin
-    await hub.broadcast("admin", {
-        "type": "opportunity.application",
-        "title": "New Application",
-        "body": f"{user.get('name', 'A contractor')} applied to {opp['title']}",
-        "at": now.isoformat()
-    })
-    
-    return {"id": app_id, "message": "Application submitted successfully"}
 
-# ---------- Public Track Endpoint ----------
-@api.get("/track/{assign_id}")
-async def track_opportunity(assign_id: str, request: Request):
-    """Public route — shows project status for a given Assign ID.
-    Client info is hidden unless status is 'approved' AND requesting user is the assigned contractor.
-    """
-    unlock = await db.opportunity_unlocks.find_one({"assign_id": assign_id}, {"_id": 0})
-    if not unlock:
-        raise HTTPException(status_code=404, detail="Assign ID not found. Please check and try again.")
+    return {"message": f"Contractor selected. {len(all_unlocks) - 1} others notified and credited ₹{refund_amount} to wallet."}
 
-    opp = await db.opportunities.find_one({"id": unlock["opportunity_id"]}, {"_id": 0})
-    if not opp:
-        raise HTTPException(status_code=404, detail="Opportunity not found.")
 
-    # Determine if requesting user is the assigned contractor
-    is_assigned_contractor = False
-    try:
-        token = request.cookies.get("access_token")
-        if not token:
-            auth = request.headers.get("Authorization", "")
-            if auth.startswith("Bearer "):
-                token = auth[7:]
-        if token:
-            import jwt as pyjwt
-            payload_jwt = pyjwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
-            requesting_user_id = payload_jwt.get("sub")
-            if requesting_user_id == unlock.get("contractor_id"):
-                is_assigned_contractor = True
-    except Exception:
-        pass
-
-    opp_status = opp.get("status", "open")
-    show_client = (opp_status == "approved") and is_assigned_contractor
-
-    result = {
-        "assign_id": assign_id,
-        "opportunity_title": opp.get("title"),
-        "opportunity_type": opp.get("opportunity_type"),
-        "city": opp.get("city"),
-        "location": opp.get("location"),
-        "description": opp.get("description"),
-        "scope_of_work": opp.get("scope_of_work"),
-        "estimated_duration": opp.get("estimated_duration"),
-        "estimated_budget": opp.get("estimated_budget"),
-        "skills_needed": opp.get("skills_needed"),
-        "status": opp_status,
-        "unlocked_at": unlock.get("unlocked_at"),
-        "is_assigned_contractor": is_assigned_contractor,
-    }
-
-    if show_client:
-        result["client_name"] = opp.get("client_name")
-        result["client_phone"] = opp.get("client_phone")
-        result["client_email"] = opp.get("client_email")
-        result["full_address"] = opp.get("full_address")
-
-    return result
-
-# ---------- Admin: Set Opportunity Status ----------
 @api.post("/admin/opportunities/{opp_id}/set-status")
 async def set_opportunity_status(opp_id: str, payload: SetOpportunityStatusIn, _: dict = Depends(require_admin)):
-    """Admin sets opportunity status. When approved, hides from other contractors."""
+    """Admin sets opportunity status manually."""
     opp = await db.opportunities.find_one({"id": opp_id}, {"_id": 0, "title": 1})
     if not opp:
         raise HTTPException(status_code=404, detail="Opportunity not found")
-
-    update = {
-        "status": payload.status,
-        "updated_at": datetime.now(timezone.utc).isoformat()
-    }
-    if payload.assigned_contractor_id:
-        update["assigned_contractor_id"] = payload.assigned_contractor_id
-
-    await db.opportunities.update_one({"id": opp_id}, {"$set": update})
+    await db.opportunities.update_one(
+        {"id": opp_id},
+        {"$set": {"status": payload.status, "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
     return {"message": f"Status updated to '{payload.status}'"}
+
+
+@api.get("/admin/opportunities/{opp_id}/applicants")
+async def get_opportunity_applicants(opp_id: str, _: dict = Depends(require_admin)):
+    """Admin sees all contractors who paid + their commission offers."""
+    applicants = []
+    async for unlock in db.opportunity_unlocks.find({"opportunity_id": opp_id, "payment_status": "paid"}, {"_id": 0}).sort("unlocked_at", 1):
+        contractor = await db.users.find_one({"id": unlock["contractor_id"]}, {"_id": 0, "name": 1, "email": 1, "phone": 1, "city": 1})
+        applicants.append({
+            "assign_id": unlock.get("assign_id"),
+            "contractor_id": unlock["contractor_id"],
+            "contractor_name": (contractor or {}).get("name", "Unknown"),
+            "contractor_email": (contractor or {}).get("email", unlock.get("contractor_email")),
+            "contractor_phone": (contractor or {}).get("phone", ""),
+            "contractor_city": (contractor or {}).get("city", ""),
+            "amount_paid": unlock.get("amount"),
+            "payment_method": unlock.get("payment_method", "razorpay"),
+            "commission_offer": unlock.get("commission_offer"),
+            "status": unlock.get("status", "applied"),
+            "unlocked_at": unlock.get("unlocked_at"),
+        })
+    return applicants
+
+
+@api.get("/my-wallet")
+async def get_my_wallet(user: dict = Depends(get_current_user)):
+    """Contractor checks their wallet balance and transaction history."""
+    if user["role"] != "contractor":
+        raise HTTPException(status_code=403, detail="Wallet is only for contractors")
+    contractor = await db.users.find_one({"id": user["id"]}, {"_id": 0, "wallet_balance": 1})
+    balance = float((contractor or {}).get("wallet_balance") or 0)
+    transactions = []
+    async for tx in db.wallet_transactions.find({"contractor_id": user["id"]}, {"_id": 0}).sort("created_at", -1).limit(20):
+        transactions.append(tx)
+    return {"balance": balance, "transactions": transactions}
+
+
+@api.post("/opportunities/{opp_id}/apply")
+async def apply_to_opportunity_legacy(opp_id: str, payload: OpportunityApplicationIn, user: dict = Depends(get_current_user)):
+    """Legacy endpoint — kept for backwards compat. Use /commission-offer instead."""
+    return {"message": "Please use /commission-offer endpoint to submit your commission offer"}
 
 @api.get("/my-opportunity-applications")
 async def get_my_applications(user: dict = Depends(get_current_user)):
