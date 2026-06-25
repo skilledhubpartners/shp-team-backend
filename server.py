@@ -30,7 +30,7 @@ import razorpay
 import hmac
 import hashlib
 
-from email_utils import send_notification_email, send_email_to, build_lead_email, build_booking_email, build_reset_email, build_unlock_payment_email
+from email_utils import send_notification_email, send_email_to, build_lead_email, build_booking_email, build_reset_email, build_unlock_payment_email, build_assign_id_email
 
 # ---------- Mongo ----------
 mongo_url = os.environ['MONGO_URL']
@@ -215,7 +215,7 @@ SITE_VISIT_PACKAGES = {
 
 # ---------- Work Opportunities Models ----------
 OpportunityType = Literal["daily_work", "site_visit", "project"]
-OpportunityStatus = Literal["open", "assigned", "completed", "cancelled"]
+OpportunityStatus = Literal["open", "in_discussion", "approved", "rejected", "completed", "assigned", "cancelled"]
 
 class WorkOpportunityIn(BaseModel):
     title: str
@@ -234,6 +234,13 @@ class WorkOpportunityIn(BaseModel):
     full_address: Optional[str] = None  # Hidden until unlocked
     status: OpportunityStatus = "open"
     deadline: Optional[str] = None  # YYYY-MM-DD
+    unlock_price: float = 49.0          # Per-opportunity unlock price
+    unlock_price_reason: Optional[str] = None  # Why this price
+    max_applicants: int = 5             # Max contractors who can unlock
+
+class SetOpportunityStatusIn(BaseModel):
+    status: OpportunityStatus
+    assigned_contractor_id: Optional[str] = None
 
 class OpportunityApplicationIn(BaseModel):
     opportunity_id: str
@@ -1213,26 +1220,38 @@ async def list_all_applications(_: dict = Depends(require_admin)):
 
 # ---------- Work Opportunities: Contractor ----------
 @api.get("/opportunities")
-async def list_opportunities(user: dict = Depends(get_current_user), status: str = "open", opportunity_type: Optional[str] = None):
-    """Contractors list available opportunities"""
+async def list_opportunities(user: dict = Depends(get_current_user), opportunity_type: Optional[str] = None):
+    """Contractors list available opportunities — only open, not yet at max applicants, not approved for someone else"""
     if user["role"] != "contractor":
         raise HTTPException(status_code=403, detail="Only contractors can view opportunities")
-    
-    query = {"status": status}
+
+    query = {"status": "open"}
     if opportunity_type:
         query["opportunity_type"] = opportunity_type
-    
+
     opportunities = []
     async for doc in db.opportunities.find(query, {"_id": 0}).sort("created_at", -1).limit(100):
-        # Check if contractor has PAID to unlock this opportunity
-        unlock = await db.opportunity_unlocks.find_one({
-            "opportunity_id": doc["id"],
-            "contractor_id": user["id"],
-            "payment_status": "paid"  # CRITICAL: only count completed payments
+        opp_id = doc["id"]
+
+        # Count how many unique contractors have PAID to unlock
+        unlock_count = await db.opportunity_unlocks.count_documents({
+            "opportunity_id": opp_id,
+            "payment_status": "paid"
         })
-        
-        if not unlock:
-            # Hide sensitive details
+        max_ap = doc.get("max_applicants", 5)
+
+        # Check if this contractor already unlocked
+        my_unlock = await db.opportunity_unlocks.find_one({
+            "opportunity_id": opp_id,
+            "contractor_id": user["id"],
+            "payment_status": "paid"
+        })
+
+        # Skip if max reached and this contractor hasn't unlocked (no new unlocks allowed)
+        if unlock_count >= max_ap and not my_unlock:
+            continue
+
+        if not my_unlock:
             doc["client_name"] = "***LOCKED***"
             doc["client_phone"] = "***LOCKED***"
             doc["client_email"] = "***LOCKED***"
@@ -1240,19 +1259,21 @@ async def list_opportunities(user: dict = Depends(get_current_user), status: str
             doc["is_locked"] = True
         else:
             doc["is_locked"] = False
-            doc["unlocked_at"] = unlock.get("unlocked_at")
-        
+            doc["unlocked_at"] = my_unlock.get("unlocked_at")
+            doc["assign_id"] = my_unlock.get("assign_id")
+
         # Check if contractor has applied
         application = await db.opportunity_applications.find_one({
-            "opportunity_id": doc["id"],
+            "opportunity_id": opp_id,
             "contractor_id": user["id"]
         })
         doc["has_applied"] = bool(application)
         if application:
             doc["application_status"] = application.get("status", "pending")
-        
+
+        doc["slots_remaining"] = max(0, max_ap - unlock_count)
         opportunities.append(doc)
-    
+
     return opportunities
 
 @api.get("/opportunities/{opp_id}")
@@ -1321,14 +1342,20 @@ async def unlock_opportunity(opp_id: str, user: dict = Depends(get_current_user)
     if not opp:
         raise HTTPException(status_code=404, detail="Opportunity not found")
 
-    # Read live price from site_config, fall back to SITE_ACCESS_FEE constant
-    try:
-        cfg_doc = await db.site_config.find_one({"_id": "main"})
-        unlock_amount = float(
-            (cfg_doc or {}).get("pricing", {}).get("site_access_fee", {}).get("amount", SITE_ACCESS_FEE)
-        )
-    except Exception:
-        unlock_amount = SITE_ACCESS_FEE
+    # Use opportunity's own unlock_price; fall back to SITE_ACCESS_FEE
+    opp_full = await db.opportunities.find_one({"id": opp_id}, {"_id": 0, "unlock_price": 1, "max_applicants": 1})
+    if not opp_full:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+    unlock_amount = float(opp_full.get("unlock_price") or SITE_ACCESS_FEE)
+
+    # Check max_applicants not exceeded
+    unlock_count = await db.opportunity_unlocks.count_documents({
+        "opportunity_id": opp_id,
+        "payment_status": "paid"
+    })
+    max_ap = opp_full.get("max_applicants", 5)
+    if unlock_count >= max_ap:
+        raise HTTPException(status_code=400, detail="This opportunity has reached its maximum number of applicants.")
 
     # Create Razorpay order — wrap in try/except so API errors return a clean message
     try:
@@ -1447,7 +1474,18 @@ async def verify_unlock_payment(
     if not unlock_record:
         raise HTTPException(status_code=404, detail="Unlock request not found. Please contact support.")
 
+    # --- Generate assign_id (SHP-YYYY-NNN) ---
+    year = datetime.now(timezone.utc).year
+    # Count existing assign_ids for this year to get next sequence
+    existing_count = await db.opportunity_unlocks.count_documents({
+        "assign_id": {"$regex": f"^SHP-{year}-"},
+        "payment_status": "paid"
+    })
+    seq = existing_count + 1
+    assign_id = f"SHP-{year}-{seq:03d}"
+
     # --- Mark as paid ---
+    now_iso = datetime.now(timezone.utc).isoformat()
     await db.opportunity_unlocks.update_one(
         {
             "razorpay_order_id": payload.razorpay_order_id,
@@ -1457,11 +1495,32 @@ async def verify_unlock_payment(
             "payment_status": "paid",
             "razorpay_payment_id": payload.razorpay_payment_id,
             "razorpay_signature": payload.razorpay_signature,
-            "unlocked_at": datetime.now(timezone.utc).isoformat()
+            "unlocked_at": now_iso,
+            "assign_id": assign_id,
+            "status": "paid"  # unlock-level status
         }}
     )
 
-    return {"status": "unlocked", "message": "Opportunity unlocked successfully"}
+    # --- Send Assign ID email to contractor ---
+    try:
+        opp_for_email = await db.opportunities.find_one({"id": opp_id}, {"_id": 0})
+        if opp_for_email:
+            subject, html = build_assign_id_email({
+                "assign_id": assign_id,
+                "contractor_name": user.get("name", user["email"]),
+                "contractor_email": user["email"],
+                "opportunity_title": opp_for_email.get("title", ""),
+                "opportunity_type": opp_for_email.get("opportunity_type", ""),
+                "city": opp_for_email.get("city", ""),
+                "estimated_budget": opp_for_email.get("estimated_budget"),
+                "estimated_duration": opp_for_email.get("estimated_duration", ""),
+                "unlocked_at": now_iso,
+            })
+            await send_email_to(user["email"], subject, html)
+    except Exception as e:
+        logging.warning("Failed to send assign_id email: %s", str(e))
+
+    return {"status": "unlocked", "message": "Opportunity unlocked successfully", "assign_id": assign_id}
 
 @api.post("/opportunities/{opp_id}/apply")
 async def apply_to_opportunity(opp_id: str, payload: OpportunityApplicationIn, user: dict = Depends(get_current_user)):
@@ -1519,6 +1578,82 @@ async def apply_to_opportunity(opp_id: str, payload: OpportunityApplicationIn, u
     })
     
     return {"id": app_id, "message": "Application submitted successfully"}
+
+# ---------- Public Track Endpoint ----------
+@api.get("/track/{assign_id}")
+async def track_opportunity(assign_id: str, request: Request):
+    """Public route — shows project status for a given Assign ID.
+    Client info is hidden unless status is 'approved' AND requesting user is the assigned contractor.
+    """
+    unlock = await db.opportunity_unlocks.find_one({"assign_id": assign_id}, {"_id": 0})
+    if not unlock:
+        raise HTTPException(status_code=404, detail="Assign ID not found. Please check and try again.")
+
+    opp = await db.opportunities.find_one({"id": unlock["opportunity_id"]}, {"_id": 0})
+    if not opp:
+        raise HTTPException(status_code=404, detail="Opportunity not found.")
+
+    # Determine if requesting user is the assigned contractor
+    is_assigned_contractor = False
+    try:
+        token = request.cookies.get("access_token")
+        if not token:
+            auth = request.headers.get("Authorization", "")
+            if auth.startswith("Bearer "):
+                token = auth[7:]
+        if token:
+            import jwt as pyjwt
+            payload_jwt = pyjwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+            requesting_user_id = payload_jwt.get("sub")
+            if requesting_user_id == unlock.get("contractor_id"):
+                is_assigned_contractor = True
+    except Exception:
+        pass
+
+    opp_status = opp.get("status", "open")
+    show_client = (opp_status == "approved") and is_assigned_contractor
+
+    result = {
+        "assign_id": assign_id,
+        "opportunity_title": opp.get("title"),
+        "opportunity_type": opp.get("opportunity_type"),
+        "city": opp.get("city"),
+        "location": opp.get("location"),
+        "description": opp.get("description"),
+        "scope_of_work": opp.get("scope_of_work"),
+        "estimated_duration": opp.get("estimated_duration"),
+        "estimated_budget": opp.get("estimated_budget"),
+        "skills_needed": opp.get("skills_needed"),
+        "status": opp_status,
+        "unlocked_at": unlock.get("unlocked_at"),
+        "is_assigned_contractor": is_assigned_contractor,
+    }
+
+    if show_client:
+        result["client_name"] = opp.get("client_name")
+        result["client_phone"] = opp.get("client_phone")
+        result["client_email"] = opp.get("client_email")
+        result["full_address"] = opp.get("full_address")
+
+    return result
+
+# ---------- Admin: Set Opportunity Status ----------
+@api.post("/admin/opportunities/{opp_id}/set-status")
+async def set_opportunity_status(opp_id: str, payload: SetOpportunityStatusIn, _: dict = Depends(require_admin)):
+    """Admin sets opportunity status. When approved, hides from other contractors."""
+    opp = await db.opportunities.find_one({"id": opp_id}, {"_id": 0, "title": 1})
+    if not opp:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+
+    update = {
+        "status": payload.status,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+    if payload.assigned_contractor_id:
+        update["assigned_contractor_id"] = payload.assigned_contractor_id
+
+    await db.opportunities.update_one({"id": opp_id}, {"$set": update})
+    return {"message": f"Status updated to '{payload.status}'"}
 
 @api.get("/my-opportunity-applications")
 async def get_my_applications(user: dict = Depends(get_current_user)):
