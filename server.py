@@ -215,7 +215,7 @@ SITE_VISIT_PACKAGES = {
 
 # ---------- Work Opportunities Models ----------
 OpportunityType = Literal["daily_work", "site_visit", "project"]
-OpportunityStatus = Literal["open", "assigned", "completed", "cancelled"]
+OpportunityStatus = Literal["open", "in_discussion", "approved", "rejected", "completed", "assigned", "cancelled"]
 
 class WorkOpportunityIn(BaseModel):
     title: str
@@ -234,6 +234,9 @@ class WorkOpportunityIn(BaseModel):
     full_address: Optional[str] = None  # Hidden until unlocked
     status: OpportunityStatus = "open"
     deadline: Optional[str] = None  # YYYY-MM-DD
+    unlock_price: float = 49.0          # Application fee per opportunity
+    unlock_price_reason: Optional[str] = None  # Shown to contractor
+    max_applicants: int = 5             # Max contractors who can apply
 
 class OpportunityApplicationIn(BaseModel):
     opportunity_id: str
@@ -1166,9 +1169,13 @@ async def create_opportunity(payload: WorkOpportunityIn, _: dict = Depends(requi
     opp_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
     
+    payload_dict = payload.dict()
     opp_doc = {
         "id": opp_id,
-        **payload.dict(),
+        **payload_dict,
+        "unlock_price": float(payload_dict.get("unlock_price") or 49.0),
+        "unlock_price_reason": payload_dict.get("unlock_price_reason") or "",
+        "max_applicants": int(payload_dict.get("max_applicants") or 5),
         "created_at": now.isoformat(),
         "updated_at": now.isoformat(),
         "applications_count": 0
@@ -1219,15 +1226,18 @@ async def get_opportunity_admin(opp_id: str, _: dict = Depends(require_admin)):
 
 @api.put("/admin/opportunities/{opp_id}")
 async def update_opportunity(opp_id: str, payload: WorkOpportunityIn, _: dict = Depends(require_admin)):
-    """Admin updates an opportunity"""
+    """Admin updates an opportunity — explicitly cast numeric fields to prevent type corruption"""
     update_data = payload.dict()
+    # Explicitly cast to correct types — prevents "2" string being saved instead of 2000 float
+    update_data["unlock_price"] = float(update_data.get("unlock_price") or 49.0)
+    update_data["max_applicants"] = int(update_data.get("max_applicants") or 5)
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
-    
+
     result = await db.opportunities.update_one({"id": opp_id}, {"$set": update_data})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Opportunity not found")
-    
-    return {"message": "Opportunity updated successfully"}
+
+    return {"message": "Opportunity updated successfully", "unlock_price": update_data["unlock_price"]}
 
 @api.delete("/admin/opportunities/{opp_id}")
 async def delete_opportunity(opp_id: str, _: dict = Depends(require_admin)):
